@@ -1,0 +1,710 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files and build
+        run: |
+          mkdir -p 'app'
+          cat > 'app/build.gradle' <<'PINSKIN_EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.pinskin.lsp'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.pinskin.lsp'
+                  minSdk 26
+                  targetSdk 33
+                  versionCode 1
+                  versionName '1.0'
+              }
+              buildTypes {
+                  release { minifyEnabled false }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              compileOnly 'de.robv.android.xposed:api:82'
+          }
+          PINSKIN_EOF
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'PINSKIN_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material"
+                  android:allowBackup="false">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="@string/xposed_desc" />
+                  <meta-data android:name="xposedminversion" android:value="82" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          PINSKIN_EOF
+          mkdir -p 'app/src/main/assets'
+          cat > 'app/src/main/assets/xposed_init' <<'PINSKIN_EOF'
+          com.pinskin.lsp.Hook
+          PINSKIN_EOF
+          mkdir -p 'app/src/main/java/com/pinskin/lsp'
+          cat > 'app/src/main/java/com/pinskin/lsp/Cfg.java' <<'PINSKIN_EOF'
+          package com.pinskin.lsp;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+
+          /** Настройки модуля. Без зависимостей от Xposed: используется и приложением, и хуком. */
+          public final class Cfg {
+              public static final String MODULE_PKG = "com.pinskin.lsp";
+              public static final String PREFS = "pinskin_prefs";
+
+              public static final String K_ENABLED = "enabled";
+              public static final String K_SHAPE = "shape";          // 0 круг, 1 скруглённый, 2 квадрат
+              public static final String K_BG = "bgColor";           // ARGB
+              public static final String K_TEXT = "textColor";       // ARGB
+              public static final String K_TEXT_SCALE = "textScale"; // 50..200 %
+              public static final String K_OPACITY = "opacity";      // 10..100 %
+              public static final String K_SX = "stretchX";          // 50..200 %
+              public static final String K_SY = "stretchY";          // 50..200 %
+              public static final String K_SMALL = "small";
+              public static final String K_NOCLIP = "noClip";
+              public static final String K_HIDE = "hideLetters";
+              public static final String K_USE_IMG = "useImage";
+              public static final String K_IMG = "imageB64";
+
+              public static boolean worldReadableFailed = false;
+
+              public boolean enabled, small, noClip, hideLetters, useImage;
+              public int shape, bgColor, textColor, textScale, opacity, stretchX, stretchY;
+              public String imageB64;
+
+              public static Cfg from(SharedPreferences sp) {
+                  Cfg c = new Cfg();
+                  c.enabled = sp.getBoolean(K_ENABLED, true);
+                  c.shape = sp.getInt(K_SHAPE, 0);
+                  c.bgColor = sp.getInt(K_BG, 0xFF3A3A3C);
+                  c.textColor = sp.getInt(K_TEXT, 0xFFFFFFFF);
+                  c.textScale = sp.getInt(K_TEXT_SCALE, 100);
+                  c.opacity = sp.getInt(K_OPACITY, 100);
+                  c.stretchX = sp.getInt(K_SX, 100);
+                  c.stretchY = sp.getInt(K_SY, 100);
+                  c.small = sp.getBoolean(K_SMALL, false);
+                  c.noClip = sp.getBoolean(K_NOCLIP, false);
+                  c.hideLetters = sp.getBoolean(K_HIDE, false);
+                  c.useImage = sp.getBoolean(K_USE_IMG, false);
+                  c.imageB64 = sp.getString(K_IMG, "");
+                  return c;
+              }
+
+              /** Открывает настройки так, чтобы их мог прочитать SystemUI (нужен активный LSPosed). */
+              @SuppressWarnings("deprecation")
+              public static SharedPreferences open(Context ctx) {
+                  try {
+                      return ctx.getSharedPreferences(PREFS, Context.MODE_WORLD_READABLE);
+                  } catch (SecurityException e) {
+                      worldReadableFailed = true;
+                      return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+                  }
+              }
+          }
+          PINSKIN_EOF
+          mkdir -p 'app/src/main/java/com/pinskin/lsp'
+          cat > 'app/src/main/java/com/pinskin/lsp/Hook.java' <<'PINSKIN_EOF'
+          package com.pinskin.lsp;
+
+          import android.view.View;
+
+          import java.util.Enumeration;
+
+          import dalvik.system.DexFile;
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XSharedPreferences;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          public class Hook implements IXposedHookLoadPackage {
+              private static final String TAG = "PinSkin: ";
+              // Имя класса кнопки цифры из AOSP. НЕ проверено на HiOS 13.5.0 (Tecno KJ6).
+              private static final String[] KEY_CLASSES = { "com.android.keyguard.NumPadKey" };
+
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
+                  if (!"com.android.systemui".equals(lpp.packageName)) return;
+
+                  final XSharedPreferences prefs = new XSharedPreferences(Cfg.MODULE_PKG, Cfg.PREFS);
+                  prefs.makeWorldReadable();
+
+                  int hooked = 0;
+                  for (String name : KEY_CLASSES) {
+                      Class<?> cls = XposedHelpers.findClassIfExists(name, lpp.classLoader);
+                      if (cls == null) {
+                          XposedBridge.log(TAG + "class not found: " + name);
+                          continue;
+                      }
+                      XposedBridge.hookAllConstructors(cls, new XC_MethodHook() {
+                          @Override
+                          protected void afterHookedMethod(MethodHookParam param) {
+                              if (!(param.thisObject instanceof View)) return;
+                              final View v = (View) param.thisObject;
+                              v.post(new Runnable() {
+                                  @Override public void run() {
+                                      try {
+                                          prefs.reload();
+                                          KeyStyler.apply(v, Cfg.from(prefs));
+                                      } catch (Throwable t) {
+                                          XposedBridge.log(t);
+                                      }
+                                  }
+                              });
+                          }
+                      });
+                      hooked++;
+                      XposedBridge.log(TAG + "hooked constructors of " + name);
+                  }
+                  if (hooked == 0) dumpCandidates(lpp);
+              }
+
+              /** Если класс не найден, пишем в лог похожие имена: по ним поправим KEY_CLASSES. */
+              private void dumpCandidates(XC_LoadPackage.LoadPackageParam lpp) {
+                  try {
+                      DexFile df = new DexFile(lpp.appInfo.sourceDir);
+                      Enumeration<String> e = df.entries();
+                      int n = 0;
+                      while (e.hasMoreElements() && n < 60) {
+                          String s = e.nextElement();
+                          String l = s.toLowerCase();
+                          if (l.contains("numpad") || l.contains("pinkey") || l.contains("keyguardpin")) {
+                              XposedBridge.log(TAG + "candidate: " + s);
+                              n++;
+                          }
+                      }
+                      df.close();
+                  } catch (Throwable t) {
+                      XposedBridge.log(t);
+                  }
+              }
+          }
+          PINSKIN_EOF
+          mkdir -p 'app/src/main/java/com/pinskin/lsp'
+          cat > 'app/src/main/java/com/pinskin/lsp/KeyStyler.java' <<'PINSKIN_EOF'
+          package com.pinskin.lsp;
+
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.graphics.Outline;
+          import android.graphics.drawable.BitmapDrawable;
+          import android.graphics.drawable.GradientDrawable;
+          import android.util.Base64;
+          import android.util.TypedValue;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.ViewOutlineProvider;
+          import android.widget.TextView;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.WeakHashMap;
+
+          /** Оформляет одну кнопку клавиатуры. Один и тот же код для превью и для SystemUI. */
+          public final class KeyStyler {
+              private static final WeakHashMap<TextView, Float> ORIG_SIZE = new WeakHashMap<>();
+              private static String cachedB64 = "";
+              private static Bitmap cachedBmp;
+
+              private KeyStyler() {}
+
+              private static synchronized Bitmap bitmap(String b64) {
+                  if (b64 == null || b64.isEmpty()) return null;
+                  if (b64.equals(cachedB64)) return cachedBmp;
+                  try {
+                      byte[] raw = Base64.decode(b64, Base64.NO_WRAP);
+                      cachedBmp = BitmapFactory.decodeByteArray(raw, 0, raw.length);
+                  } catch (Throwable t) {
+                      cachedBmp = null;
+                  }
+                  cachedB64 = b64;
+                  return cachedBmp;
+              }
+
+              private static void collect(View v, List<TextView> out) {
+                  if (v instanceof TextView) {
+                      out.add((TextView) v);
+                  } else if (v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) collect(g.getChildAt(i), out);
+                  }
+              }
+
+              public static void apply(View key, Cfg c) {
+                  if (!c.enabled) return;
+                  float density = key.getResources().getDisplayMetrics().density;
+
+                  List<TextView> tvs = new ArrayList<>();
+                  collect(key, tvs);
+                  TextView digit = null, letters = null;
+                  for (TextView tv : tvs) {
+                      CharSequence t = tv.getText();
+                      if (digit == null && t != null && t.length() == 1 && Character.isDigit(t.charAt(0))) digit = tv;
+                      else if (letters == null) letters = tv;
+                  }
+                  if (digit == null && !tvs.isEmpty()) {
+                      digit = tvs.get(0);
+                      letters = tvs.size() > 1 ? tvs.get(1) : null;
+                  }
+
+                  // Фон кнопки
+                  final int shape = c.shape;
+                  Bitmap bmp = c.useImage ? bitmap(c.imageB64) : null;
+                  if (bmp != null) {
+                      key.setBackground(new BitmapDrawable(key.getResources(), bmp));
+                      key.setOutlineProvider(new ViewOutlineProvider() {
+                          @Override public void getOutline(View v, Outline o) {
+                              int w = v.getWidth(), h = v.getHeight();
+                              if (shape == 2) o.setRect(0, 0, w, h);
+                              else o.setRoundRect(0, 0, w, h, Math.min(w, h) / (shape == 0 ? 2f : 4f));
+                          }
+                      });
+                      key.setClipToOutline(true);
+                  } else {
+                      GradientDrawable g = new GradientDrawable();
+                      g.setColor(c.bgColor);
+                      if (shape == 0) g.setShape(GradientDrawable.OVAL);
+                      else {
+                          g.setShape(GradientDrawable.RECTANGLE);
+                          g.setCornerRadius(shape == 1 ? 18 * density : 0f);
+                      }
+                      key.setBackground(g);
+                      key.setClipToOutline(false);
+                  }
+
+                  // Текст
+                  if (digit != null) {
+                      digit.setTextColor(c.textColor);
+                      Float orig = ORIG_SIZE.get(digit);
+                      if (orig == null) { orig = digit.getTextSize(); ORIG_SIZE.put(digit, orig); }
+                      digit.setTextSize(TypedValue.COMPLEX_UNIT_PX, orig * c.textScale / 100f);
+                  }
+                  if (letters != null) {
+                      if (c.hideLetters) letters.setVisibility(View.GONE);
+                      else letters.setTextColor(c.textColor);
+                  }
+
+                  // Размер, прозрачность, обрезка
+                  float small = c.small ? 0.8f : 1f;
+                  key.setScaleX(c.stretchX / 100f * small);
+                  key.setScaleY(c.stretchY / 100f * small);
+                  key.setAlpha(c.opacity / 100f);
+                  if (c.noClip) {
+                      View cur = key;
+                      for (int i = 0; i < 4 && cur.getParent() instanceof ViewGroup; i++) {
+                          ViewGroup p = (ViewGroup) cur.getParent();
+                          p.setClipChildren(false);
+                          p.setClipToPadding(false);
+                          cur = p;
+                      }
+                  }
+              }
+          }
+          PINSKIN_EOF
+          mkdir -p 'app/src/main/java/com/pinskin/lsp'
+          cat > 'app/src/main/java/com/pinskin/lsp/MainActivity.java' <<'PINSKIN_EOF'
+          package com.pinskin.lsp;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.graphics.Color;
+          import android.media.ThumbnailUtils;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.util.Base64;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.ArrayAdapter;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.GridLayout;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.Spinner;
+          import android.widget.Switch;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import android.widget.AdapterView;
+          import android.widget.CompoundButton;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+              private static final int REQ_IMG = 11;
+              private static final String[] LETTERS = {"", "ABC", "DEF", "GHI", "JKL", "MNO", "PQRS", "TUV", "WXYZ"};
+
+              private SharedPreferences sp;
+              private final List<View> keys = new ArrayList<>();
+              private LinearLayout root;
+
+              private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  sp = Cfg.open(this);
+                  Cfg c = Cfg.from(sp);
+
+                  ScrollView sv = new ScrollView(this);
+                  root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(16), dp(16), dp(16), dp(40));
+                  sv.addView(root);
+                  setContentView(sv);
+
+                  text("Кастомизация пароля", 22, true);
+                  if (Cfg.worldReadableFailed) {
+                      text("⚠ LSPosed не активен для этого модуля: SystemUI не сможет прочитать настройки. "
+                              + "Включи модуль в LSPosed и открой приложение заново.", 13, false);
+                  }
+                  sw("Включить оформление", Cfg.K_ENABLED, c.enabled);
+
+                  text("Интерактивное превью (так будут выглядеть кнопки)", 14, false);
+                  buildPreview();
+
+                  section("Форма и цвет");
+                  Spinner shape = new Spinner(this);
+                  shape.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
+                          new String[]{"Круг", "Скруглённый квадрат", "Квадрат"}));
+                  shape.setSelection(c.shape);
+                  shape.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                      @Override public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
+                          if (sp.getInt(Cfg.K_SHAPE, 0) != pos) { sp.edit().putInt(Cfg.K_SHAPE, pos).apply(); refresh(); }
+                      }
+                      @Override public void onNothingSelected(AdapterView<?> p) {}
+                  });
+                  root.addView(shape);
+                  colorRow("Цвет кнопок", Cfg.K_BG, c.bgColor);
+                  colorRow("Цвет цифр", Cfg.K_TEXT, c.textColor);
+
+                  section("Размер и прозрачность");
+                  seek("Прозрачность", Cfg.K_OPACITY, 10, 100, c.opacity);
+                  seek("Растягивание по X", Cfg.K_SX, 50, 200, c.stretchX);
+                  seek("Растягивание по Y", Cfg.K_SY, 50, 200, c.stretchY);
+                  seek("Размер цифр", Cfg.K_TEXT_SCALE, 50, 200, c.textScale);
+                  sw("Формат small (кнопки меньше на 20%)", Cfg.K_SMALL, c.small);
+                  sw("Выключить обрезку (кнопки могут выходить за рамку)", Cfg.K_NOCLIP, c.noClip);
+                  sw("Скрыть буквы под цифрами", Cfg.K_HIDE, c.hideLetters);
+
+                  section("Своя картинка на кнопках");
+                  sw("Использовать картинку вместо цвета", Cfg.K_USE_IMG, c.useImage);
+                  Button pick = new Button(this);
+                  pick.setText("Выбрать картинку из галереи");
+                  pick.setOnClickListener(v -> {
+                      Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                      i.setType("image/*");
+                      startActivityForResult(i, REQ_IMG);
+                  });
+                  root.addView(pick);
+                  Button clear = new Button(this);
+                  clear.setText("Убрать картинку");
+                  clear.setOnClickListener(v -> {
+                      sp.edit().remove(Cfg.K_IMG).putBoolean(Cfg.K_USE_IMG, false).apply();
+                      recreate();
+                  });
+                  root.addView(clear);
+
+                  section("Готовые стили");
+                  presetRow();
+
+                  section("Действия");
+                  Button restart = new Button(this);
+                  restart.setText("Перезапустить SystemUI (нужен root)");
+                  restart.setOnClickListener(v -> restartSystemUi());
+                  root.addView(restart);
+                  Button reset = new Button(this);
+                  reset.setText("Сбросить всё");
+                  reset.setOnClickListener(v -> { sp.edit().clear().apply(); recreate(); });
+                  root.addView(reset);
+
+                  text("Как включить:\n1) LSPosed → Модули → PinSkin → включить.\n"
+                          + "2) Область действия: отметить «Интерфейс системы» (com.android.systemui).\n"
+                          + "3) Нажать «Перезапустить SystemUI» (или перезагрузить телефон).\n"
+                          + "4) Заблокировать экран и открыть ввод PIN/пароля. После этого изменения "
+                          + "настроек видны сразу при следующем открытии клавиатуры.", 13, false);
+                  refresh();
+              }
+
+              // ---------- UI helpers ----------
+              private TextView text(String s, int sp_, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(sp_);
+                  t.setPadding(0, dp(8), 0, dp(4));
+                  if (bold) t.setTypeface(null, android.graphics.Typeface.BOLD);
+                  root.addView(t);
+                  return t;
+              }
+
+              private void section(String s) { text(s, 16, true).setPadding(0, dp(20), 0, dp(4)); }
+
+              private void sw(String label, final String key, boolean val) {
+                  Switch s = new Switch(this);
+                  s.setText(label);
+                  s.setChecked(val);
+                  s.setPadding(0, dp(8), 0, dp(8));
+                  s.setOnCheckedChangeListener((CompoundButton cb, boolean on) -> {
+                      sp.edit().putBoolean(key, on).apply();
+                      refresh();
+                  });
+                  root.addView(s);
+              }
+
+              private void seek(final String label, final String key, final int min, final int max, int val) {
+                  final TextView t = new TextView(this);
+                  t.setText(label + ": " + val + "%");
+                  t.setPadding(0, dp(8), 0, 0);
+                  SeekBar s = new SeekBar(this);
+                  s.setMax(max - min);
+                  s.setProgress(val - min);
+                  s.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override public void onProgressChanged(SeekBar sb, int pr, boolean user) {
+                          int v = pr + min;
+                          t.setText(label + ": " + v + "%");
+                          if (user) { sp.edit().putInt(key, v).apply(); refresh(); }
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar sb) {}
+                      @Override public void onStopTrackingTouch(SeekBar sb) {}
+                  });
+                  root.addView(t);
+                  root.addView(s);
+              }
+
+              private static String hex(int c) { return String.format("#%08X", c); }
+
+              private void colorRow(final String label, final String key, int val) {
+                  final Button b = new Button(this);
+                  b.setText(label + ": " + hex(val));
+                  b.setOnClickListener(v -> {
+                      final EditText et = new EditText(this);
+                      et.setText(hex(sp.getInt(key, val)));
+                      new AlertDialog.Builder(this)
+                              .setTitle(label + " (#RRGGBB или #AARRGGBB)")
+                              .setView(et)
+                              .setPositiveButton("OK", (d, w) -> {
+                                  try {
+                                      int col = Color.parseColor(et.getText().toString().trim());
+                                      sp.edit().putInt(key, col).apply();
+                                      b.setText(label + ": " + hex(col));
+                                      refresh();
+                                  } catch (IllegalArgumentException e) {
+                                      Toast.makeText(this, "Неверный цвет", Toast.LENGTH_SHORT).show();
+                                  }
+                              })
+                              .setNegativeButton("Отмена", null)
+                              .show();
+                  });
+                  root.addView(b);
+              }
+
+              private void presetRow() {
+                  // shape, bg, text, opacity, stretchX, stretchY, small
+                  final Object[][] presets = {
+                          {"Классика", 0, 0xFF3A3A3C, 0xFFFFFFFF, 100, 100, 100, false},
+                          {"Неон", 0, 0xFF1A0B3A, 0xFF00FFC8, 100, 100, 100, false},
+                          {"Стекло", 0, 0x55FFFFFF, 0xFFFFFFFF, 90, 100, 100, false},
+                          {"Квадраты", 2, 0xFF222222, 0xFFFFD60A, 100, 100, 100, true},
+                  };
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  for (final Object[] p : presets) {
+                      Button bt = new Button(this);
+                      bt.setText((String) p[0]);
+                      bt.setAllCaps(false);
+                      bt.setOnClickListener(v -> {
+                          sp.edit().putInt(Cfg.K_SHAPE, (Integer) p[1]).putInt(Cfg.K_BG, (Integer) p[2])
+                                  .putInt(Cfg.K_TEXT, (Integer) p[3]).putInt(Cfg.K_OPACITY, (Integer) p[4])
+                                  .putInt(Cfg.K_SX, (Integer) p[5]).putInt(Cfg.K_SY, (Integer) p[6])
+                                  .putBoolean(Cfg.K_SMALL, (Boolean) p[7]).apply();
+                          recreate();
+                      });
+                      row.addView(bt, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  }
+                  root.addView(row);
+              }
+
+              // ---------- Preview ----------
+              private void buildPreview() {
+                  LinearLayout box = new LinearLayout(this);
+                  box.setBackgroundColor(0xFF1C1C1E);
+                  box.setGravity(Gravity.CENTER);
+                  box.setPadding(dp(8), dp(24), dp(8), dp(24));
+                  box.setClipChildren(false);
+                  box.setClipToPadding(false);
+
+                  GridLayout grid = new GridLayout(this);
+                  grid.setColumnCount(3);
+                  grid.setClipChildren(false);
+                  grid.setClipToPadding(false);
+                  int[] order = {1, 2, 3, 4, 5, 6, 7, 8, 9, -1, 0, -1};
+                  for (int d : order) {
+                      GridLayout.LayoutParams lp = new GridLayout.LayoutParams();
+                      lp.width = dp(76);
+                      lp.height = dp(76);
+                      lp.setMargins(dp(6), dp(6), dp(6), dp(6));
+                      if (d < 0) { grid.addView(new View(this), lp); continue; }
+
+                      FrameLayout key = new FrameLayout(this);
+                      LinearLayout inner = new LinearLayout(this);
+                      inner.setOrientation(LinearLayout.VERTICAL);
+                      inner.setGravity(Gravity.CENTER);
+                      TextView digit = new TextView(this);
+                      digit.setText(String.valueOf(d));
+                      digit.setTextSize(26);
+                      digit.setGravity(Gravity.CENTER);
+                      TextView letters = new TextView(this);
+                      letters.setText(d >= 1 ? LETTERS[d - 1 < LETTERS.length ? d - 1 : 0] : "");
+                      letters.setTextSize(9);
+                      letters.setGravity(Gravity.CENTER);
+                      inner.addView(digit);
+                      inner.addView(letters);
+                      key.addView(inner, new FrameLayout.LayoutParams(
+                              ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
+                      keys.add(key);
+                      grid.addView(key, lp);
+                  }
+                  box.addView(grid);
+                  root.addView(box);
+              }
+
+              private void refresh() {
+                  Cfg c = Cfg.from(sp);
+                  c.enabled = true; // в превью всегда показываем стиль
+                  for (View k : keys) KeyStyler.apply(k, c);
+              }
+
+              // ---------- Image ----------
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req != REQ_IMG || res != RESULT_OK || data == null || data.getData() == null) return;
+                  try {
+                      String b64 = encode(data.getData());
+                      sp.edit().putString(Cfg.K_IMG, b64).putBoolean(Cfg.K_USE_IMG, true).apply();
+                      recreate();
+                  } catch (Exception e) {
+                      Toast.makeText(this, "Не удалось прочитать картинку", Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              private String encode(Uri u) throws Exception {
+                  BitmapFactory.Options o = new BitmapFactory.Options();
+                  o.inJustDecodeBounds = true;
+                  try (InputStream in = getContentResolver().openInputStream(u)) {
+                      BitmapFactory.decodeStream(in, null, o);
+                  }
+                  int big = Math.max(o.outWidth, o.outHeight), s = 1;
+                  while (big / s > 512) s *= 2;
+                  o = new BitmapFactory.Options();
+                  o.inSampleSize = s;
+                  Bitmap bmp;
+                  try (InputStream in = getContentResolver().openInputStream(u)) {
+                      bmp = BitmapFactory.decodeStream(in, null, o);
+                  }
+                  if (bmp == null) throw new Exception("decode failed");
+                  Bitmap sq = ThumbnailUtils.extractThumbnail(bmp, 192, 192);
+                  ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                  sq.compress(bmp.hasAlpha() ? Bitmap.CompressFormat.PNG : Bitmap.CompressFormat.JPEG, 90, bo);
+                  return Base64.encodeToString(bo.toByteArray(), Base64.NO_WRAP);
+              }
+
+              // ---------- Restart SystemUI ----------
+              private void restartSystemUi() {
+                  new Thread(() -> {
+                      String msg;
+                      try {
+                          Process p = new ProcessBuilder("su", "-c", "kill $(pidof com.android.systemui)").start();
+                          int code = p.waitFor();
+                          msg = code == 0 ? "SystemUI перезапускается" : "su вернул код " + code + ". Перезагрузи телефон.";
+                      } catch (Exception e) {
+                          msg = "Нет root-доступа. Перезагрузи телефон.";
+                      }
+                      final String m = msg;
+                      runOnUiThread(() -> Toast.makeText(this, m, Toast.LENGTH_LONG).show());
+                  }).start();
+              }
+          }
+          PINSKIN_EOF
+          mkdir -p 'app/src/main/res/values'
+          cat > 'app/src/main/res/values/strings.xml' <<'PINSKIN_EOF'
+          <resources>
+              <string name="app_name">PinSkin</string>
+              <string name="xposed_desc">Кастомизация клавиатуры PIN/пароля на экране блокировки (Tecno HiOS)</string>
+              <string-array name="xposed_scope">
+                  <item>com.android.systemui</item>
+              </string-array>
+          </resources>
+          PINSKIN_EOF
+          cat > 'build.gradle' <<'PINSKIN_EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          PINSKIN_EOF
+          cat > 'gradle.properties' <<'PINSKIN_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          PINSKIN_EOF
+          cat > 'settings.gradle' <<'PINSKIN_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url 'https://api.xposed.info/' }
+              }
+          }
+          rootProject.name = 'PinSkin'
+          include ':app'
+          PINSKIN_EOF
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PinSkin-apk
+          path: app/build/outputs/apk/debug/*.apk
